@@ -1,0 +1,162 @@
+name: Build patched SideStore
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build patched SideStore IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply AFC and profile diagnostics
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          gateway_path = Path("Dependencies/minimuxer/Sources/IdeviceGateway.swift")
+          gateway = gateway_path.read_text()
+
+          helper_anchor = '''    private func safeFreeError(_ err: UnsafeMutablePointer<IdeviceFfiError>?) {'''
+          helper = (
+              '    private func describeError(_ err: UnsafeMutablePointer<IdeviceFfiError>) -> String {\n'
+              '        let message = getErrorMessage(from: err)\n'
+              '        return "code=\\(err.pointee.code), subCode=\\(err.pointee.sub_code), message=\\(message)"\n'
+              '    }\n\n'
+              '    private func safeFreeError(_ err: UnsafeMutablePointer<IdeviceFfiError>?) {'
+          )
+          assert helper_anchor in gateway
+          gateway = gateway.replace(helper_anchor, helper, 1)
+
+          misagent_replacements = (
+              (
+                  "let msg = self.getErrorMessage(from: installErr)",
+                  "let details = self.describeError(installErr)",
+              ),
+              (
+                  'misagent_install failed: \\(msg)',
+                  'misagent_install failed: \\(details)',
+              ),
+              (
+                  'Failed to install profile: \\(msg)',
+                  'Failed to install profile: \\(details)',
+              ),
+          )
+          for old, new in misagent_replacements:
+              assert gateway.count(old) == 1, old
+              gateway = gateway.replace(old, new, 1)
+
+          function_start = gateway.index("    func yeetAppAfc(bundleId: String, ipaBytes: Data) throws {")
+          body_start = gateway.index("        ) { client in\n", function_start) + len("        ) { client in\n")
+          body_end = gateway.index("            defer {\n                verboseLog(\"[IdeviceGateway] yeetAppAfc() closing remote file handle\")", body_start)
+
+          replacement = '''            func ensureDirectory(_ path: String) throws {
+                              verboseLog("[IdeviceGateway] yeetAppAfc() creating directory: \\(path)")
+                              let mkdirError = path.withCString { pathPtr in
+                                  afc_make_directory(client, pathPtr)
+                              }
+                              guard let mkdirError else { return }
+
+                              let code = mkdirError.pointee.code
+                              let subCode = mkdirError.pointee.sub_code
+                              let details = self.describeError(mkdirError)
+                              defer { self.safeFreeError(mkdirError) }
+
+                              // ObjectExists is expected during refreshes and repeated installs.
+                              guard !(code == 106 && subCode == 16) else {
+                                  verboseLog("[IdeviceGateway] yeetAppAfc() directory already exists: \\(path)")
+                                  return
+                              }
+
+                              debugLog("[IdeviceGateway] yeetAppAfc() afc_make_directory failed for \\(path): \\(details)")
+                              throw IdeviceGatewayError.serviceError(
+                                  "Failed to create remote AFC directory \\(path): \\(details)"
+                              )
+                          }
+
+                          let stagingDir = MinimuxerConstants.pkgPath
+                          try ensureDirectory(stagingDir)
+                          let bundleDir = "\\(stagingDir)/\\(bundleId)"
+                          try ensureDirectory(bundleDir)
+
+                          let path = "\\(bundleDir)/app.ipa"
+                          var fileHandle: OpaquePointer? = nil
+                          verboseLog("[IdeviceGateway] yeetAppAfc() opening remote file: \\(path)")
+                          let openErr = path.withCString { pathPtr in
+                              afc_file_open(client, pathPtr, AfcFopenMode(rawValue: 3), &fileHandle) // WrOnly
+                          }
+                          if let openErr = openErr {
+                              let details = self.describeError(openErr)
+                              debugLog("[IdeviceGateway] yeetAppAfc() afc_file_open failed for \\(path): \\(details)")
+                              defer { self.safeFreeError(openErr) }
+                              throw IdeviceGatewayError.serviceError(
+                                  "Failed to open remote AFC file \\(path): \\(details)"
+                              )
+                          }
+                          guard let fileHandle else {
+                              debugLog("[IdeviceGateway] yeetAppAfc() afc_file_open returned success with nil handle for \\(path)")
+                              throw IdeviceGatewayError.serviceError(
+                                  "AFC returned a nil file handle for \\(path)"
+                              )
+                          }
+          '''
+
+          gateway = gateway[:body_start] + replacement + gateway[body_end:]
+          gateway_path.write_text(gateway)
+
+          refresh_path = Path("AltStore/Operations/RefreshAppOperation.swift")
+          refresh = refresh_path.read_text()
+          old_throw = "                throw MinimuxerWrapperError.profileInstall"
+          new_throw = (
+              '                debugLog("[RefreshAppOperation] installProvisioningProfiles failed: '
+              '\\(String(reflecting: error))")\n'
+              "                throw error"
+          )
+          assert refresh.count(old_throw) == 1
+          refresh_path.write_text(refresh.replace(old_throw, new_throw, 1))
+          PY
+
+          git diff --check
+          git -C Dependencies/minimuxer diff --check
+          grep -n "AfcFopenMode(rawValue: 3)" Dependencies/minimuxer/Sources/IdeviceGateway.swift
+
+      - name: Validate patched Minimuxer
+        run: swift build --package-path Dependencies/minimuxer -c debug
+
+      - name: Install build tools
+        run: brew install ldid xcbeautify
+
+      - name: Set build version
+        run: |
+          BASE_VERSION=$(python3 scripts/ci/workflow.py get-marketing-version)
+          SHORT_COMMIT=$(git rev-parse --short HEAD)
+          PATCHED_VERSION="${BASE_VERSION}-afcfix.${{ github.run_number }}+${SHORT_COMMIT}"
+          python3 scripts/ci/workflow.py set-marketing-version "$PATCHED_VERSION"
+          echo "PATCHED_VERSION=$PATCHED_VERSION" >> "$GITHUB_ENV"
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1.6.0
+        with:
+          xcode-version: "26.4"
+
+      - name: Build SideStore
+        run: |
+          python3 scripts/ci/workflow.py build
+          mv SideStore.ipa "SideStore-${PATCHED_VERSION}.ipa"
+
+      - name: Upload patched IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideStore-${{ env.PATCHED_VERSION }}.ipa
+          path: SideStore-${{ env.PATCHED_VERSION }}.ipa
+          if-no-files-found: error
