@@ -112,19 +112,70 @@ jobs:
           '''
 
           gateway = gateway[:body_start] + replacement + gateway[body_end:]
-          gateway_path.write_text(gateway)
 
-          minimuxer_path = Path("Dependencies/minimuxer/Sources/MinimuxerImpl.swift")
-          minimuxer = minimuxer_path.read_text()
-          ddi_start = minimuxer.index("        do {\n            try await matchingPriority{", minimuxer.index("    func start(pairingFile:"))
-          ddi_end_marker = '            debugLog("[minimuxer] WARN: Initial DDI mount skipped during startup: \\(error.localizedDescription)")\n        }\n'
-          ddi_end = minimuxer.index(ddi_end_marker, ddi_start) + len(ddi_end_marker)
-          deferred_ddi = (
-              "        // DDI is not required for profile management, AFC, or app installation.\n"
-              "        // debugApp() and attachDebugger() already mount it lazily via ensureDDIMounted().\n"
-              '        debugLog("[minimuxer] Initial DDI mount deferred until a debug session is requested")\n'
+          rp_action_anchor = '''        defer {
+                      verboseLog("[IdeviceGateway] performWithService(\\(serviceName)) performing cleanup")
+                      cleanup(client)
+                  }
+                  verboseLog("[IdeviceGateway] performWithService(\\(serviceName)) executing action")'''
+          rp_action_patched = '''        defer {
+                      verboseLog("[IdeviceGateway] performWithService(\\(serviceName)) performing cleanup")
+                      cleanup(client)
+                  }
+                  if serviceName == "image mounter" {
+                      try primeImageMounterClient()
+                  }
+                  verboseLog("[IdeviceGateway] performWithService(\\(serviceName)) executing action")'''
+          assert gateway.count(rp_action_anchor) == 1
+          gateway = gateway.replace(rp_action_anchor, rp_action_patched, 1)
+
+          tcp_action_anchor = '''        defer { cleanup(client) }
+
+                  return try action(client)
+              }
+
+              private func performWithEitherService<T>('''
+          tcp_action_patched = '''        defer { cleanup(client) }
+
+                  if serviceName == "image mounter" {
+                      try primeImageMounterClient()
+                  }
+                  return try action(client)
+              }
+
+              /// mobile_image_mounter requires a fresh Lockdown query after the
+              /// service client is established. Without it iOS closes the first
+              /// mounter request and rustls reports UnexpectedEof.
+              private func primeImageMounterClient() throws {
+                  verboseLog("[IdeviceGateway] image mounter connected; priming with a post-connect Lockdown query")
+                  guard let productVersion = try getLockdownValue(key: "ProductVersion") else {
+                      debugLog("[IdeviceGateway] image mounter prime failed: ProductVersion was nil")
+                      throw IdeviceGatewayError.serviceError(
+                          "Failed to prime image mounter with a post-connect Lockdown query"
+                      )
+                  }
+                  debugLog("[IdeviceGateway] image mounter prime succeeded; ProductVersion=\\(productVersion)")
+              }
+
+              private func performWithEitherService<T>('''
+          assert gateway.count(tcp_action_anchor) == 1
+          gateway = gateway.replace(tcp_action_anchor, tcp_action_patched, 1)
+
+          manual_mounter_start = gateway.index("    private func mountPersonalizedDdiIdevice(")
+          manual_mounter_anchor = '''        defer { image_mounter_free(mounterClient) }
+
+          //        if try isDeveloperDiskImageMounted'''
+          manual_mounter_patched = '''        defer { image_mounter_free(mounterClient) }
+                  try primeImageMounterClient()
+
+          //        if try isDeveloperDiskImageMounted'''
+          assert gateway.count(manual_mounter_anchor, manual_mounter_start) == 1
+          gateway = (
+              gateway[:manual_mounter_start]
+              + gateway[manual_mounter_start:].replace(manual_mounter_anchor, manual_mounter_patched, 1)
           )
-          minimuxer_path.write_text(minimuxer[:ddi_start] + deferred_ddi + minimuxer[ddi_end:])
+
+          gateway_path.write_text(gateway)
 
           refresh_path = Path("AltStore/Operations/RefreshAppOperation.swift")
           refresh = refresh_path.read_text()
@@ -157,7 +208,8 @@ jobs:
           git diff --check
           git -C Dependencies/minimuxer diff --check
           grep -n "AfcFopenMode(rawValue: 3)" Dependencies/minimuxer/Sources/IdeviceGateway.swift
-          grep -n "Initial DDI mount deferred" Dependencies/minimuxer/Sources/MinimuxerImpl.swift
+          grep -n "image mounter prime succeeded" Dependencies/minimuxer/Sources/IdeviceGateway.swift
+          grep -n "try primeImageMounterClient()" Dependencies/minimuxer/Sources/IdeviceGateway.swift
           grep -n "waiting separately for a notification can hang forever" "AltStore/My Apps/MyAppsViewController.swift"
 
       - name: Validate patched Minimuxer
