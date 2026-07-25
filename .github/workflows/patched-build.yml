@@ -114,6 +114,18 @@ jobs:
           gateway = gateway[:body_start] + replacement + gateway[body_end:]
           gateway_path.write_text(gateway)
 
+          minimuxer_path = Path("Dependencies/minimuxer/Sources/MinimuxerImpl.swift")
+          minimuxer = minimuxer_path.read_text()
+          ddi_start = minimuxer.index("        do {\n            try await matchingPriority{", minimuxer.index("    func start(pairingFile:"))
+          ddi_end_marker = '            debugLog("[minimuxer] WARN: Initial DDI mount skipped during startup: \\(error.localizedDescription)")\n        }\n'
+          ddi_end = minimuxer.index(ddi_end_marker, ddi_start) + len(ddi_end_marker)
+          deferred_ddi = (
+              "        // DDI is not required for profile management, AFC, or app installation.\n"
+              "        // debugApp() and attachDebugger() already mount it lazily via ensureDDIMounted().\n"
+              '        debugLog("[minimuxer] Initial DDI mount deferred until a debug session is requested")\n'
+          )
+          minimuxer_path.write_text(minimuxer[:ddi_start] + deferred_ddi + minimuxer[ddi_end:])
+
           refresh_path = Path("AltStore/Operations/RefreshAppOperation.swift")
           refresh = refresh_path.read_text()
           old_throw = "                throw MinimuxerWrapperError.profileInstall"
@@ -124,11 +136,29 @@ jobs:
           )
           assert refresh.count(old_throw) == 1
           refresh_path.write_text(refresh.replace(old_throw, new_throw, 1))
+
+          my_apps_path = Path("AltStore/My Apps/MyAppsViewController.swift")
+          my_apps = my_apps_path.read_text()
+          wait_start = my_apps.index(
+              "                // async-let so the for-loop below runs first, ensuring we catch didFetchSourceNotification.",
+              my_apps.index("    @objc func checkForUpdates"),
+          )
+          wait_end = my_apps.index("                do\n                {", wait_start)
+          my_apps = my_apps[:wait_start] + my_apps[wait_end:]
+          old_result = "                        let (_, context) = try await result"
+          new_result = (
+              "                        // Await the fetch itself; waiting separately for a notification can hang forever.\n"
+              "                        let (_, context) = try await AppManager.shared.fetchSources()"
+          )
+          assert my_apps.count(old_result) == 1
+          my_apps_path.write_text(my_apps.replace(old_result, new_result, 1))
           PY
 
           git diff --check
           git -C Dependencies/minimuxer diff --check
           grep -n "AfcFopenMode(rawValue: 3)" Dependencies/minimuxer/Sources/IdeviceGateway.swift
+          grep -n "Initial DDI mount deferred" Dependencies/minimuxer/Sources/MinimuxerImpl.swift
+          grep -n "waiting separately for a notification can hang forever" "AltStore/My Apps/MyAppsViewController.swift"
 
       - name: Validate patched Minimuxer
         run: swift build --package-path Dependencies/minimuxer -c debug
