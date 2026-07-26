@@ -123,7 +123,9 @@ jobs:
                       cleanup(client)
                   }
                   if serviceName == "image mounter" {
-                      try primeImageMounterClient()
+                      return try withRsdImageMounterKeepalive {
+                          try action(client)
+                      }
                   }
                   verboseLog("[IdeviceGateway] performWithService(\\(serviceName)) executing action")'''
           assert gateway.count(rp_action_anchor) == 1
@@ -138,23 +140,88 @@ jobs:
           tcp_action_patched = '''        defer { cleanup(client) }
 
                   if serviceName == "image mounter" {
-                      try primeImageMounterClient()
+                      return try withTcpImageMounterKeepalive(provider: provider) {
+                          try action(client)
+                      }
                   }
                   return try action(client)
               }
 
-              /// mobile_image_mounter requires a fresh Lockdown query after the
-              /// service client is established. Without it iOS closes the first
-              /// mounter request and rustls reports UnexpectedEof.
-              private func primeImageMounterClient() throws {
-                  verboseLog("[IdeviceGateway] image mounter connected; priming with a post-connect Lockdown query")
-                  guard let productVersion = try getLockdownValue(key: "ProductVersion") else {
-                      debugLog("[IdeviceGateway] image mounter prime failed: ProductVersion was nil")
+              private func withQueriedImageMounterLockdown<T>(
+                  _ lockdownClient: OpaquePointer,
+                  action: () throws -> T
+              ) throws -> T {
+                  var plistVal: plist_t? = nil
+                  let valueErr = lockdownd_get_value(lockdownClient, "ProductVersion", nil, &plistVal)
+                  if let valueErr {
+                      let details = describeError(valueErr)
+                      defer { safeFreeError(valueErr) }
+                      debugLog("[IdeviceGateway] image mounter Lockdown keepalive query failed: \\(details)")
                       throw IdeviceGatewayError.serviceError(
-                          "Failed to prime image mounter with a post-connect Lockdown query"
+                          "Failed to query ProductVersion for image mounter keepalive: \\(details)"
                       )
                   }
-                  debugLog("[IdeviceGateway] image mounter prime succeeded; ProductVersion=\\(productVersion)")
+                  guard let plistVal else {
+                      throw IdeviceGatewayError.serviceError(
+                          "Image mounter Lockdown keepalive returned a nil ProductVersion"
+                      )
+                  }
+                  defer { safeFreePlist(plistVal) }
+                  guard let productVersion = getRustPlistString(plistVal) else {
+                      throw IdeviceGatewayError.serviceError(
+                          "Image mounter Lockdown keepalive returned an invalid ProductVersion"
+                      )
+                  }
+                  debugLog("[IdeviceGateway] image mounter Lockdown keepalive active; ProductVersion=\\(productVersion)")
+                  return try action()
+              }
+
+              private func withTcpImageMounterKeepalive<T>(
+                  provider: OpaquePointer,
+                  action: () throws -> T
+              ) throws -> T {
+                  var lockdownClient: OpaquePointer? = nil
+                  let connectErr = lockdownd_connect(provider, &lockdownClient)
+                  if let connectErr {
+                      let details = describeError(connectErr)
+                      defer { safeFreeError(connectErr) }
+                      throw IdeviceGatewayError.serviceError(
+                          "Failed to open image mounter Lockdown keepalive: \\(details)"
+                      )
+                  }
+                  guard let lockdownClient else {
+                      throw IdeviceGatewayError.noConnection
+                  }
+                  defer {
+                      verboseLog("[IdeviceGateway] closing image mounter Lockdown keepalive after service operation")
+                      lockdownd_client_free(lockdownClient)
+                  }
+                  return try withQueriedImageMounterLockdown(lockdownClient, action: action)
+              }
+
+              private func withRsdImageMounterKeepalive<T>(
+                  action: () throws -> T
+              ) throws -> T {
+                  guard let adapter, let handshake else {
+                      throw IdeviceGatewayError.noConnection
+                  }
+                  var lockdownClient: OpaquePointer? = nil
+                  let connectErr = lockdownd_connect_rsd(adapter, handshake, &lockdownClient)
+                  if let connectErr {
+                      let details = describeError(connectErr)
+                      defer { safeFreeError(connectErr) }
+                      throw IdeviceGatewayError.serviceError(
+                          "Failed to open RSD image mounter Lockdown keepalive: \\(details)"
+                      )
+                  }
+                  guard let lockdownClient else {
+                      throw IdeviceGatewayError.noConnection
+                  }
+                  defer {
+                      verboseLog("[IdeviceGateway] closing RSD image mounter Lockdown keepalive after service operation")
+                      lockdownd_client_free(lockdownClient)
+                  }
+                  return try withQueriedImageMounterLockdown(lockdownClient, action: action)
               }
 
               private func performWithEitherService<T>('''
@@ -166,13 +233,58 @@ jobs:
 
           //        if try isDeveloperDiskImageMounted'''
           manual_mounter_patched = '''        defer { image_mounter_free(mounterClient) }
-                  try primeImageMounterClient()
+                  try withTcpImageMounterKeepalive(provider: provider) {
 
           //        if try isDeveloperDiskImageMounted'''
           assert gateway.count(manual_mounter_anchor, manual_mounter_start) == 1
           gateway = (
               gateway[:manual_mounter_start]
               + gateway[manual_mounter_start:].replace(manual_mounter_anchor, manual_mounter_patched, 1)
+          )
+
+          manual_mounter_end = '''                    verboseLog("[IdeviceGateway] mountPersonalizedDdiIdevice() mount succeeded")
+                          }
+                      }
+                  }
+              }
+
+              func isDDIMounted() throws -> Bool {'''
+          manual_mounter_end_patched = '''                    verboseLog("[IdeviceGateway] mountPersonalizedDdiIdevice() mount succeeded")
+                          }
+                      }
+                  }
+                  }
+              }
+
+              func isDDIMounted() throws -> Bool {'''
+          assert gateway.count(manual_mounter_end, manual_mounter_start) == 1
+          gateway = (
+              gateway[:manual_mounter_start]
+              + gateway[manual_mounter_start:].replace(manual_mounter_end, manual_mounter_end_patched, 1)
+          )
+
+          heartbeat_signature = '''    func performHeartbeat(interval: UInt64, newInterval: UnsafeMutablePointer<UInt64>) throws {
+                 debugLog("[IdeviceGateway] performHeartbeat() called, interval: \\(interval)")'''
+          heartbeat_signature_patched = '''    func performHeartbeat(
+                  interval: UInt64,
+                  newInterval: UnsafeMutablePointer<UInt64>,
+                  onConnected: (() -> Void)? = nil
+              ) throws {
+                 debugLog("[IdeviceGateway] performHeartbeat() called, interval: \\(interval)")'''
+          assert gateway.count(heartbeat_signature) == 1
+          gateway = gateway.replace(heartbeat_signature, heartbeat_signature_patched, 1)
+
+          heartbeat_action = '''       ) { client in
+                     verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")'''
+          heartbeat_action_patched = '''       ) { client in
+                     onConnected?()
+                     debugLog("[IdeviceGateway] heartbeat client connected; waiting for Marco")
+                     verboseLog("[IdeviceGateway] performHeartbeat() calling heartbeat_get_marco")'''
+          heartbeat_function_start = gateway.index("    func performHeartbeat(")
+          assert gateway.count(heartbeat_action, heartbeat_function_start) == 1
+          gateway = (
+              gateway[:heartbeat_function_start]
+              + gateway[heartbeat_function_start:].replace(heartbeat_action, heartbeat_action_patched, 1)
           )
 
           gateway_path.write_text(gateway)
@@ -203,13 +315,135 @@ jobs:
           )
           assert my_apps.count(old_result) == 1
           my_apps_path.write_text(my_apps.replace(old_result, new_result, 1))
+
+          heartbeat_path = Path("Dependencies/minimuxer/Sources/Services/HeartbeatService.swift")
+          heartbeat = heartbeat_path.read_text()
+          heartbeat = heartbeat.replace(
+              "        var taskActive = false\n",
+              "        var taskActive = false\n        var clientConnected = false\n",
+              1,
+          )
+          heartbeat = heartbeat.replace(
+              "            taskActive = true\n            return true",
+              "            taskActive = true\n            clientConnected = false\n            return true",
+              1,
+          )
+          heartbeat = heartbeat.replace(
+              "        func stop() {\n            running = false\n        }",
+              "        func stop() {\n            running = false\n            clientConnected = false\n        }",
+              1,
+          )
+          terminate_anchor = '''        func terminate() {
+                      taskActive = false
+                      running = false
+                  }'''
+          terminate_patched = '''        func terminate() {
+                      taskActive = false
+                      running = false
+                      clientConnected = false
+                  }
+
+                  func setClientConnected(_ connected: Bool) {
+                      clientConnected = connected
+                  }
+
+                  func isClientConnected() -> Bool {
+                      clientConnected
+                  }'''
+          assert heartbeat.count(terminate_anchor) == 1
+          heartbeat = heartbeat.replace(terminate_anchor, terminate_patched, 1)
+
+          heartbeat_stop_anchor = '''    static func stop() async {
+                  await state.stop()
+                  lastBeatSuccessful = false
+                  verboseLog("[minimuxer] HeartbeatService stop requested")
+              }
+
+              private static func logIfNeeded'''
+          heartbeat_stop_patched = '''    static func stop() async {
+                  await state.stop()
+                  lastBeatSuccessful = false
+                  verboseLog("[minimuxer] HeartbeatService stop requested")
+              }
+
+              static func waitUntilConnected() async -> Bool {
+                  for _ in 0..<60 {
+                      if await state.isClientConnected() {
+                          return true
+                      }
+                      try? await Task.sleep(nanoseconds: 100_000_000)
+                  }
+                  return await state.isClientConnected()
+              }
+
+              private static func logIfNeeded'''
+          assert heartbeat.count(heartbeat_stop_anchor) == 1
+          heartbeat = heartbeat.replace(heartbeat_stop_anchor, heartbeat_stop_patched, 1)
+
+          heartbeat_call = "                try IdeviceGateway.shared.performHeartbeat(interval: currentInterval, newInterval: &newInterval)"
+          heartbeat_call_patched = '''                try IdeviceGateway.shared.performHeartbeat(
+                          interval: currentInterval,
+                          newInterval: &newInterval,
+                          onConnected: {
+                              Task {
+                                  await state.setClientConnected(true)
+                              }
+                          }
+                      )'''
+          assert heartbeat.count(heartbeat_call) == 1
+          heartbeat = heartbeat.replace(heartbeat_call, heartbeat_call_patched, 1)
+          heartbeat_catch = '''            } catch {
+                          logIfNeeded("Heartbeat failed: \\(error)")'''
+          heartbeat_catch_patched = '''            } catch {
+                          await state.setClientConnected(false)
+                          logIfNeeded("Heartbeat failed: \\(error)")'''
+          assert heartbeat.count(heartbeat_catch) == 1
+          heartbeat_path.write_text(heartbeat.replace(heartbeat_catch, heartbeat_catch_patched, 1))
+
+          minimuxer_path = Path("Dependencies/minimuxer/Sources/MinimuxerImpl.swift")
+          minimuxer = minimuxer_path.read_text()
+          start_anchor = '''        try await restartMuxerServer()
+                  
+                  do {'''
+          start_patched = '''        try await restartMuxerServer()
+
+                  if !isrppairing {
+                      await HeartbeatService.start()
+                      if await HeartbeatService.waitUntilConnected() {
+                          debugLog("[minimuxer] heartbeat transport ready before service operations")
+                      } else {
+                          debugLog("[minimuxer] WARN: heartbeat did not connect within 6 seconds; service operations may be reset by the device")
+                      }
+                  }
+                  
+                  do {'''
+          assert minimuxer.count(start_anchor) == 1
+          minimuxer = minimuxer.replace(start_anchor, start_patched, 1)
+          stop_anchor = '''        MuxerService.stop()
+                  // mark ready!'''
+          stop_patched = '''        await HeartbeatService.stop()
+                  MuxerService.stop()
+                  // mark ready!'''
+          assert minimuxer.count(stop_anchor) == 1
+          minimuxer_path.write_text(minimuxer.replace(stop_anchor, stop_patched, 1))
+
+          health_path = Path("AltStore/Settings/HealthCheckView.swift")
+          health = health_path.read_text()
+          health_sleep = "            try? await Task.sleep(nanoseconds: 1_000_000_000)"
+          health_sleep_patched = (
+              "            // Device checks open real services; avoid churning them every second.\n"
+              "            try? await Task.sleep(nanoseconds: 5_000_000_000)"
+          )
+          assert health.count(health_sleep) == 1
+          health_path.write_text(health.replace(health_sleep, health_sleep_patched, 1))
           PY
 
           git diff --check
           git -C Dependencies/minimuxer diff --check
           grep -n "AfcFopenMode(rawValue: 3)" Dependencies/minimuxer/Sources/IdeviceGateway.swift
-          grep -n "image mounter prime succeeded" Dependencies/minimuxer/Sources/IdeviceGateway.swift
-          grep -n "try primeImageMounterClient()" Dependencies/minimuxer/Sources/IdeviceGateway.swift
+          grep -n "image mounter Lockdown keepalive active" Dependencies/minimuxer/Sources/IdeviceGateway.swift
+          grep -n "heartbeat transport ready before service operations" Dependencies/minimuxer/Sources/MinimuxerImpl.swift
+          grep -n "heartbeat client connected; waiting for Marco" Dependencies/minimuxer/Sources/IdeviceGateway.swift
           grep -n "waiting separately for a notification can hang forever" "AltStore/My Apps/MyAppsViewController.swift"
 
       - name: Validate patched Minimuxer
